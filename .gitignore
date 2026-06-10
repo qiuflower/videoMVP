@@ -1,0 +1,17 @@
+# Environment variables (contains API keys/secrets)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local logs
+logs/
+*.log
+
+# Generated outputs
+output/
+
+# Media / raw videos
+video/
+*.mp4
