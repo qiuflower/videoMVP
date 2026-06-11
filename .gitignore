@@ -15,6 +15,6 @@ output/
 # Media / raw videos
 video/
 *.mp4
-!generated/**/*.mp4
-!assets/**/*.mp4
+generated/
+assets/
 
