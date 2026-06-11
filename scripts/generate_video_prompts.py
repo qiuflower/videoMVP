@@ -16,14 +16,25 @@ import os
 import sys
 import csv
 import argparse
+import json
 
 # 动态添加项目根目录到 sys.path，支持在任意目录下运行该脚本
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.config import DEFAULT_STORYBOARD_CSV, DEFAULT_OUTPUT_DIR
-from core.utils import get_logger
+from core.utils import get_logger, resolve_asset_paths
 
 logger = get_logger("video_prompts")
+
+def build_frame_prompt(scale, target_char, content, scene, focal_length, camera_direction, visual_style):
+    """
+    根据 GPTImage2 & NanoBanana 规范构建单帧文生图/图生图提示词
+    """
+    return (
+        f"Cinematic {scale} shot of {target_char}. 【画面内容：{content}】 in 【场景：{scene}】. "
+        f"镜头参数：{focal_length}, {camera_direction}. 画面风格：{visual_style}. "
+        f"Realistic photograph, high-resolution details, cinematic lighting. --ar 16:9 --no watermarks, signatures, text"
+    )
 
 def main():
     default_csv = DEFAULT_STORYBOARD_CSV
@@ -45,6 +56,17 @@ def main():
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
+    # 加载视觉资产元数据配置，用于在此阶段动态解析绑定
+    assets_meta_path = os.path.join(output_dir, "assets_metadata.json")
+    assets_meta = {"characters": {}, "scenes": {}}
+    if os.path.exists(assets_meta_path):
+        try:
+            with open(assets_meta_path, "r", encoding="utf-8") as f_meta:
+                assets_meta = json.load(f_meta)
+            logger.info("成功加载资产路径元数据配置。")
+        except Exception as e:
+            logger.warning(f"无法加载 assets_metadata.json: {e}")
+
     # 读取分镜与新剧本数据
     script_records = []
     with open(csv_path, "r", encoding="utf-8-sig") as f:
@@ -53,7 +75,7 @@ def main():
             script_records.append(row)
 
     logger.info(f"成功读取到 {len(script_records)} 个镜头剧本。")
-    logger.info("正在根据用户的严格标准模板生成视频重绘提示词 (Video Redraw Prompts)...")
+    logger.info("正在进行视觉资产解析绑定并生成视频重绘提示词 (Video Redraw Prompts)...")
 
     prompt_records = []
     for r in script_records:
@@ -68,6 +90,16 @@ def main():
         orig_content = r.get("原画面内容", r.get("画面内容", ""))
         orig_dialogue = r.get("原台词/旁白", r.get("台词/旁白", ""))
         orig_audio = r.get("原音效/音乐", r.get("音效/音乐", ""))
+        
+        # 尾帧评估数据
+        is_end_frame = r.get("是否需要尾帧", "否")
+        end_frame_desc = r.get("尾帧画面描述", "无")
+        
+        # 5要素额外字段
+        new_scene = r.get("新场景", "")
+        focal_length = r.get("新焦段", "自适应")
+        camera_direction = r.get("新镜头方位", "自适应")
+        visual_style = r.get("新画面风格", "默认风格")
 
         # 判定参考人像角色
         target_char = r.get("参考角色", "").strip()
@@ -80,11 +112,89 @@ def main():
             elif "同事" in new_content:
                 target_char = "林艾与同事"
 
-        # 使用用户提供的精确指令模板
-        prompt = (
-            f"根据原视频中的景别（{scale}）、运动镜头（{movement}），将场景人物和画面内容替换成：【{new_content}】。"
-            f"同时，将场景人物替换成如图所示的参考人像（{target_char}）的样貌和场景。新台词为：【{dialogue}】。时长为 {duration}秒。"
+        # 1. 动态匹配所有角色参考图，支持一镜包含多个角色
+        matched_chars_links = []
+        char_ref_path = "assets/character_ref.png"
+        chars_dict = assets_meta.get("characters", {})
+        if chars_dict:
+            char_paths, char_names = resolve_asset_paths(target_char, chars_dict, category="characters")
+            if char_paths:
+                char_ref_path = ",".join(char_paths)
+                for name_key, path_val in zip(char_names, char_paths):
+                    matched_chars_links.append(f"[角色参考-{name_key}]({path_val})")
+            else:
+                # 默认兜底使用第一个角色
+                first_name = list(chars_dict.keys())[0]
+                first_path = list(chars_dict.values())[0]
+                matched_chars_links.append(f"[角色参考-{first_name}]({first_path})")
+                char_ref_path = first_path
+        else:
+            matched_chars_links.append(f"[角色参考]({char_ref_path})")
+
+        # 2. 动态匹配所有场景参考图
+        matched_scenes_links = []
+        scene_ref_path = "assets/scene_ref.png"
+        scenes_dict = assets_meta.get("scenes", {})
+        if scenes_dict:
+            scene_paths, scene_names = resolve_asset_paths(new_scene, scenes_dict, category="scenes")
+            if scene_paths:
+                scene_ref_path = ",".join(scene_paths)
+                for name_key, path_val in zip(scene_names, scene_paths):
+                    matched_scenes_links.append(f"[场景参考-{name_key}]({path_val})")
+            else:
+                # 默认兜底使用第一个场景
+                first_name = list(scenes_dict.keys())[0]
+                first_path = list(scenes_dict.values())[0]
+                matched_scenes_links.append(f"[场景参考-{first_name}]({first_path})")
+                scene_ref_path = first_path
+        else:
+            matched_scenes_links.append(f"[场景参考]({scene_ref_path})")
+
+        # 4个资产相关的基本字段
+        orig_video_path = r.get("原视频路径", f"scenes/Scene-{shot_id}.mp4")
+        redraw_video_path = r.get("重绘视频路径", f"generated/Scene-{shot_id}_redraw.mp4")
+
+        # 编译首帧与尾帧的文生图/图生图提示词 (完全基于 GPTImage2 和 NanoBanana 规范)
+        first_frame_prompt = build_frame_prompt(
+            scale=scale,
+            target_char=target_char,
+            content=new_content,
+            scene=new_scene,
+            focal_length=focal_length,
+            camera_direction=camera_direction,
+            visual_style=visual_style
         )
+        
+        if is_end_frame == "是":
+            end_frame_prompt = build_frame_prompt(
+                scale=scale,
+                target_char=target_char,
+                content=end_frame_desc,
+                scene=new_scene,
+                focal_length=focal_length,
+                camera_direction=camera_direction,
+                visual_style=visual_style
+            )
+        else:
+            end_frame_prompt = "无"
+
+        # 使用用户提供的精细 5要素 融合提示词模板
+        audio_part = ""
+        if audio and audio.strip() != "无" and audio.strip() != "无音效":
+            audio_part = f"新音效为：【{audio}】。"
+
+        prompt = (
+            f"根据原视频中的景别（{scale}）、运动镜头（{movement}），结合新焦段（{focal_length}）和镜头方位（{camera_direction}），"
+            f"将场景人物、场景、画面风格和画面内容替换为：【{new_content}】，画面风格为：【{visual_style}】。"
+            f"同时，将场景人物替换成如图所示的参考人像（{target_char}）的样貌和场景。新台词为：【{dialogue}】。{audio_part}时长为 {duration}秒。"
+        )
+
+        # 整合并重构超链接列，包含原片、重绘视频以及匹配到的全部视觉资产链接
+        all_links = [
+            f"[原片视频]({orig_video_path})", 
+            f"[重绘视频]({redraw_video_path})"
+        ] + matched_chars_links + matched_scenes_links
+        related_links = ", ".join(all_links)
 
         prompt_records.append({
             "镜号": shot_id,
@@ -96,10 +206,23 @@ def main():
             "原音效/音乐": orig_audio,
             "新画面内容": new_content,
             "参考角色": target_char,
+            "新场景": new_scene,
+            "新焦段": focal_length,
+            "新镜头方位": camera_direction,
+            "新画面风格": visual_style,
             "新台词/旁白": dialogue,
             "新音效/音乐": audio,
+            "是否需要尾帧": is_end_frame,
+            "尾帧画面描述": end_frame_desc,
+            "新首帧生图提示词": first_frame_prompt,
+            "新尾帧生图提示词": end_frame_prompt,
             "视频重绘提示词": prompt,
-            "预览图": preview
+            "预览图": preview,
+            "原视频路径": orig_video_path,
+            "角色参考图路径": char_ref_path,
+            "场景参考图路径": scene_ref_path,
+            "重绘视频路径": redraw_video_path,
+            "相关链接": related_links
         })
 
     # 尝试从现有的 storyboard.md 中读取故事标题以保持一致
@@ -118,16 +241,46 @@ def main():
 
     # 1. 导出/覆写主分镜 Markdown 文件
     md_path = os.path.join(output_dir, "storyboard.md")
+    
+    # 动态加载资产元数据并编译为 Markdown 表格插入到文件头部
+    assets_meta_path = os.path.join(output_dir, "assets_metadata.json")
+    assets_markdown = ""
+    if os.path.exists(assets_meta_path):
+        try:
+            with open(assets_meta_path, "r", encoding="utf-8") as f_meta:
+                assets_meta = json.load(f_meta)
+            assets_rows = []
+            for name, path in assets_meta.get("characters", {}).items():
+                assets_rows.append(f"| 角色人物 | {name} | <img src=\"../{path}\" width=\"80\" /> | `{path}` |")
+            for name, path in assets_meta.get("scenes", {}).items():
+                assets_rows.append(f"| 场景风格 | {name} | <img src=\"../{path}\" width=\"80\" /> | `{path}` |")
+            if assets_rows:
+                assets_markdown = (
+                    "## 🎨 核心视觉资产参考 (Core Visual Assets)\n\n"
+                    "本分镜剧本使用以下核心视觉资产参考图进行人物与场景的一致性锁定：\n\n"
+                    "| 资产类型 | 资产名称 | 预览图 | 本地参考路径 |\n"
+                    "| --- | --- | --- | --- |\n"
+                    + "\n".join(assets_rows) + "\n\n---\n\n"
+                )
+        except Exception as e:
+            pass
+
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# {story_title} —— 视频分镜剧本\n\n")
         f.write("此分镜剧本基于原视频节奏，由大语言模型重构，保持了镜头规格、运镜和时长 100% 对应。\n\n")
-        f.write("| 镜号 | 镜头预览 | 镜头参数 | 原片分镜参考 | 全新创意剧本 | 视频重绘提示词 |\n")
-        f.write("| --- | --- | --- | --- | --- | --- |\n")
+        if assets_markdown:
+            f.write(assets_markdown)
+        f.write("| 镜号 | 镜头预览 | 镜头参数 | 原片分镜参考 | 全新创意剧本 | 新首帧图像 | 新尾帧图像 | 相关链接 | 视频重绘提示词 |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
         for rec in prompt_records:
-            img_md = f"![镜号 {rec['镜号']}]({rec['预览图']})" if rec['预览图'] else "无"
+            img_md = f"<img src=\"{rec['预览图']}\" width=\"120\" style=\"min-width: 120px;\" />" if rec['预览图'] else "无"
             
-            # 镜头参数
-            param_str = f"景别：{rec['景别']}<br>运镜：{rec['运动镜头']}<br>时长：{rec['时长(秒)']}秒"
+            # 镜头参数 (保持精简)
+            param_str = (
+                f"景别：{rec['景别']}<br>"
+                f"运镜：{rec['运动镜头']}<br>"
+                f"时长：{rec['时长(秒)']}秒"
+            )
             
             # 原片分镜参考
             orig_content_clean = rec['原画面内容'].replace("\n", "<br>")
@@ -135,24 +288,57 @@ def main():
             orig_audio_clean = rec['原音效/音乐'].replace("\n", "<br>")
             ref_str = f"【画面内容】{orig_content_clean}<br>【台词/旁白】{orig_dialogue_clean}<br>【音效/音乐】{orig_audio_clean}"
             
-            # 全新创意剧本
+            # 全新创意剧本 (保持精炼)
             new_content_clean = rec['新画面内容'].replace("\n", "<br>")
             char_clean = rec['参考角色'].replace("\n", "<br>")
+            scene_clean = rec.get('新场景', '').replace("\n", "<br>")
+            focal_clean = rec.get('新焦段', '').replace("\n", "<br>")
+            cam_clean = rec.get('新镜头方位', '').replace("\n", "<br>")
+            style_clean = rec.get('新画面风格', '').replace("\n", "<br>")
             new_dialogue_clean = rec['新台词/旁白'].replace("\n", "<br>")
             new_audio_clean = rec['新音效/音乐'].replace("\n", "<br>")
-            script_str = f"【新画面】{new_content_clean}<br>【角色】{char_clean}<br>【新台词】{new_dialogue_clean}<br>【新音效】{new_audio_clean}"
+            script_str = (
+                f"【新画面】{new_content_clean}<br>"
+                f"【角色】{char_clean}<br>"
+                f"【新场景】{scene_clean}<br>"
+                f"【新焦段】{focal_clean}<br>"
+                f"【镜头方位】{cam_clean}<br>"
+                f"【画面风格】{style_clean}<br>"
+                f"【新台词】{new_dialogue_clean}<br>"
+                f"【新音效】{new_audio_clean}"
+            )
+            
+            # 新首尾帧生图预览与提示词，使用 img 标签控制显示宽度与最小宽度，防止被表格挤压
+            first_frame_path = f"assets/Scene-{rec['镜号']}_first.png"
+            first_img_md = f"<img src=\"../{first_frame_path}\" width=\"120\" style=\"min-width: 120px;\" /><br>**首帧提示词**：<br>`{rec['新首帧生图提示词']}`"
+            
+            if rec.get('是否需要尾帧', '否') == '是':
+                end_frame_path = f"assets/Scene-{rec['镜号']}_last.png"
+                end_img_md = f"<img src=\"../{end_frame_path}\" width=\"80\" style=\"min-width: 80px;\" /><br>**尾帧提示词**：<br>`{rec['新尾帧生图提示词']}`"
+            else:
+                end_img_md = "无（AI评估无需尾帧）"
+
+            # 独立的相关链接呈现，以换行分割，调整相对路径以适应 output/ 子目录下的 storyboard.md
+            links_str = rec['相关链接']
+            import re
+            links_str = re.sub(r'\((assets|generated)/', r'(../\1/', links_str)
+            links_str = links_str.replace(", ", "<br>")
+            links_html = f"<div style=\"min-width: 120px;\">{links_str}</div>"
             
             prompt_clean = rec['视频重绘提示词'].replace("\n", "<br>")
             
-            f.write(f"| {rec['镜号']} | {img_md} | {param_str} | {ref_str} | {script_str} | {prompt_clean} |\n")
+            f.write(f"| {rec['镜号']} | {img_md} | {param_str} | {ref_str} | {script_str} | {first_img_md} | {end_img_md} | {links_html} | {prompt_clean} |\n")
 
     # 2. 导出/覆写主分镜 CSV 文件
     csv_path_out = os.path.join(output_dir, "storyboard.csv")
     csv_headers = [
         "镜号", "景别", "运动镜头", "时长(秒)", 
         "原画面内容", "原台词/旁白", "原音效/音乐",
-        "新画面内容", "参考角色", "新台词/旁白", "新音效/音乐", 
-        "预览图", "视频重绘提示词"
+        "新画面内容", "参考角色", "新场景", "新焦段", "新镜头方位", "新画面风格",
+        "新台词/旁白", "新音效/音乐", "是否需要尾帧", "尾帧画面描述",
+        "新首帧生图提示词", "新尾帧生图提示词", "预览图", 
+        "原视频路径", "角色参考图路径", "场景参考图路径", "重绘视频路径", "相关链接",
+        "视频重绘提示词"
     ]
     with open(csv_path_out, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
@@ -168,9 +354,22 @@ def main():
                 rec["原音效/音乐"],
                 rec["新画面内容"],
                 rec["参考角色"],
+                rec["新场景"],
+                rec["新焦段"],
+                rec["新镜头方位"],
+                rec["新画面风格"],
                 rec["新台词/旁白"],
                 rec["新音效/音乐"],
+                rec.get("是否需要尾帧", "否"),
+                rec.get("尾帧画面描述", "无"),
+                rec.get("新首帧生图提示词", "无"),
+                rec.get("新尾帧生图提示词", "无"),
                 rec["预览图"],
+                rec["原视频路径"],
+                rec["角色参考图路径"],
+                rec["场景参考图路径"],
+                rec["重绘视频路径"],
+                rec["相关链接"],
                 rec["视频重绘提示词"]
             ])
 

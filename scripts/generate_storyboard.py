@@ -199,13 +199,13 @@ def main():
 - 台词_旁白：从画面中识别中文字幕
 - 音效_音乐：建议最适合的背景音乐或音效
 直接以双花括号包裹 JSON：
-{
+{{
   "景别": "...",
   "运动镜头": "...",
   "画面内容": "...",
   "台词_旁白": "...",
   "音效_音乐": "..."
-}"""
+}}"""
 
     storyboard_records = []
 
@@ -258,6 +258,9 @@ def main():
         elif len(keyframes) == 1:
             preview_img_relative = f"keyframes/{os.path.basename(keyframes[0])}"
             
+        # 获取视频的相对路径，例如 scenes/XXX.mp4
+        video_relative_path = f"scenes/{file_name}"
+
         storyboard_records.append({
             "镜号": shot_num,
             "景别": parsed_data["景别"],
@@ -266,7 +269,8 @@ def main():
             "画面内容": parsed_data["画面内容"],
             "台词/旁白": parsed_data["台词_旁白"],
             "音效/音乐": parsed_data["音效_音乐"],
-            "预览图": preview_img_relative
+            "预览图": preview_img_relative,
+            "原视频路径": video_relative_path
         })
 
     # ================= 导出结果 =================
@@ -283,7 +287,7 @@ def main():
             img_markdown = f"![镜号 {rec['镜号']}]({rec['预览图']})" if rec['预览图'] else "无"
             
             # 整理数据为垂直紧凑格式
-            param_str = f"景别：{rec['景别']}<br>运镜：{rec['运动镜头']}<br>时长：{rec['时长']}秒"
+            param_str = f"景别：{rec['景别']}<br>运镜：{rec['运动镜头']}<br>时长：{rec['时长']}秒<br>[点击播放原片]({rec['原视频路径']})"
             
             content_clean = rec['画面内容'].replace("\n", "<br>")
             dialogue_clean = rec['台词/旁白'].replace("\n", "<br>")
@@ -296,7 +300,7 @@ def main():
     csv_path = os.path.join(output_dir, "storyboard.csv")
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["镜号", "景别", "运动镜头", "时长(秒)", "画面内容", "台词/旁白", "音效/音乐", "预览图"])
+        writer.writerow(["镜号", "景别", "运动镜头", "时长(秒)", "画面内容", "台词/旁白", "音效/音乐", "预览图", "原视频路径"])
         for rec in storyboard_records:
             writer.writerow([
                 rec["镜号"],
@@ -306,7 +310,8 @@ def main():
                 rec["画面内容"],
                 rec["台词/旁白"],
                 rec["音效/音乐"],
-                rec["预览图"]
+                rec["预览图"],
+                rec["原视频路径"]
             ])
 
     logger.info(f"分镜表生成完成！共生成了 {len(storyboard_records)} 个镜头的分镜。")

@@ -66,3 +66,59 @@ def clean_json_response(content):
             lines = lines[:-1]
         content = "\n".join(lines).strip()
     return content
+
+
+def resolve_asset_paths(target_string, assets_dict, category="characters"):
+    """
+    根据目标字符串（如角色名称或场景名称）与资产字典进行模糊/精确匹配，
+    返回匹配到的资产物理路径列表与名称列表。
+    """
+    import re
+    matched_paths = []
+    matched_names = []
+    
+    if not target_string:
+        return matched_paths, matched_names
+        
+    target_string = target_string.strip()
+    if target_string in ["无", "无人物", "自适应", "默认风格", "待生成"]:
+        return matched_paths, matched_names
+        
+    # 遍历 assets_dict 进行匹配
+    for name_key, path_val in assets_dict.items():
+        matched = False
+        # 1. 提取核心中文字符集
+        # 过滤掉一些常见辅助或连词中文字符，避免误判
+        filter_chars = {"和", "与", "人", "的", "个", "主", "角", "在", "中", "里", "景", "处", "型", "化", "新"}
+        common_chars = set(name_key) & set(target_string)
+        common_chars = {c for c in common_chars if c not in filter_chars}
+        
+        # 2. 匹配规则：字符重合数大于等于2，或者一个是另一个的子串
+        if len(common_chars) >= 2 or name_key in target_string or target_string in name_key:
+            matched = True
+        else:
+            # 去除一些常见的前后缀后再做子串包含匹配
+            core_name = name_key.replace("年轻女创业者", "").replace("老园丁", "")
+            if core_name and core_name in target_string:
+                matched = True
+                
+        if matched:
+            if path_val not in matched_paths:
+                matched_paths.append(path_val)
+                matched_names.append(name_key)
+                
+    # 3. 常见角色名称兜底映射规则
+    if not matched_paths and category == "characters":
+        if any(k in target_string for k in ["主角", "女创业者", "林禾", "林艾"]):
+            lin_he_path = assets_dict.get("年轻女创业者林禾")
+            if lin_he_path:
+                matched_paths.append(lin_he_path)
+                matched_names.append("年轻女创业者林禾")
+        if any(k in target_string for k in ["周伯", "老园丁", "老园丁周伯"]):
+            zhou_bo_path = assets_dict.get("老园丁周伯")
+            if zhou_bo_path:
+                matched_paths.append(zhou_bo_path)
+                matched_names.append("老园丁周伯")
+                
+    return matched_paths, matched_names
+
