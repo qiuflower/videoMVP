@@ -28,9 +28,13 @@ def run_script(script_name, args=[]):
     cmd = [sys.executable, script_path] + args
     print(f"[Run] 正在运行: {' '.join(cmd)}")
     
-    # 捕获并实时流式输出日志，使用 sys.stdout.encoding 保证与当前控制台终端一致，并容错处理
-    console_encoding = sys.stdout.encoding or "utf-8"
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding=console_encoding, errors="replace")
+    # 统一子进程环境变量为 UTF-8 编码，防止中文在管道传输中产生乱码
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    
+    # 捕获并实时流式输出日志，强制使用 utf-8 解码管道流，外部 print 会自动适应当前控制台编码输出
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=env)
     
     while True:
         output = process.stdout.readline()

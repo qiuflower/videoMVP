@@ -30,3 +30,9 @@ DEFAULT_INPUT_VIDEO = os.path.join(BASE_DIR, "video", "1275065186-1-192.mp4")
 DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 DEFAULT_OUTPUT_SCENES_DIR = os.path.join(DEFAULT_OUTPUT_DIR, "scenes")
 DEFAULT_STORYBOARD_CSV = os.path.join(DEFAULT_OUTPUT_DIR, "storyboard.csv")
+
+# 统一的LLM及生图 API 配置 defaults (优先从环境变量读取，带兜底)
+DEFAULT_API_KEY = os.environ.get("T8STAR_API_KEY", "sk-JAV9WU0LnpGolL7bH8FhBAr857nDGjjX4xNDfk6P2H0qaMZT")
+DEFAULT_BASE_URL = os.environ.get("T8STAR_BASE_URL", "https://api.tutujin.com/v1")
+DEFAULT_MODEL = os.environ.get("T8STAR_MODEL", "gpt-5.2-chat")
+

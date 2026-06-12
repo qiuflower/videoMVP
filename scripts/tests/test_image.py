@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
-import os
-import requests
-import json
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from core.config import DEFAULT_API_KEY, DEFAULT_BASE_URL
 
-api_key = os.environ.get("T8STAR_API_KEY") or "sk-HZ6UTcRmzWCPue0W3S9JL6YN67h0OilXgIHFPxZWunGWfBDr"
-url = "https://ai.t8star.org/v1/chat/completions"
+api_key = DEFAULT_API_KEY
+url = DEFAULT_BASE_URL.rstrip("/") + "/chat/completions"
 headers = {
     "Content-Type": "application/json",
     "Authorization": f"Bearer {api_key}"

@@ -21,18 +21,36 @@ import json
 # 动态添加项目根目录到 sys.path，支持在任意目录下运行该脚本
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import DEFAULT_STORYBOARD_CSV, DEFAULT_OUTPUT_DIR
-from core.utils import get_logger, resolve_asset_paths
+from core.config import DEFAULT_STORYBOARD_CSV, DEFAULT_OUTPUT_DIR, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_API_KEY
+from core.llm_client import call_t8star_llm
+from core.utils import clean_json_response, get_logger, resolve_asset_paths
 
 logger = get_logger("video_prompts")
 
 def build_frame_prompt(scale, target_char, content, scene, focal_length, camera_direction, visual_style):
     """
-    根据 GPTImage2 & NanoBanana 规范构建单帧文生图/图生图提示词
+    根据人物/场景参考图与原视频构图构建高一致性的单帧生图提示词，避免冗余的细节描述导致一致性偏差
     """
+    # 动态匹配参考图的引导指代
+    has_char = target_char and target_char not in ["无", "无人物", "自适应", "默认风格"]
+    has_scene = scene and scene not in ["无", "自适应", "默认风格"]
+    
+    ref_parts = []
+    if has_char:
+        ref_parts.append("人物参考图")
+    if has_scene:
+        ref_parts.append("场景参考图")
+        
+    ref_str = "和".join(ref_parts)
+    prefix = f"根据提供的{ref_str}，" if ref_str else ""
+    
+    char_part = f"角色为：{target_char}，" if has_char else ""
+    scene_part = f"场景为：{scene}，" if has_scene else ""
+    
     return (
-        f"Cinematic {scale} shot of {target_char}. 【画面内容：{content}】 in 【场景：{scene}】. "
-        f"镜头参数：{focal_length}, {camera_direction}. 画面风格：{visual_style}. "
+        f"{prefix}生成一幅电影感 {scale} 镜头。{char_part}{scene_part}画面具体动作与内容为：【{content}】。 "
+        f"请严格继承并保持参考图中的人物容貌、服饰发型、色彩基调以及场景的视觉风格，确保画面高度一致。 "
+        f"镜头参数：{focal_length}，{camera_direction}。画面风格：{visual_style}。 "
         f"Realistic photograph, high-resolution details, cinematic lighting. --ar 16:9 --no watermarks, signatures, text"
     )
 
@@ -46,7 +64,12 @@ def main():
     parser = argparse.ArgumentParser(description="根据原镜头参数与新剧本生成符合严格模板的视频重绘提示词")
     parser.add_argument("--csv-input", default=default_csv, help="主分镜 CSV 路径")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="t8star API Key")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API 的 baseurl 路径")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="调用的模型名称")
     args = parser.parse_args()
+
+    api_key = args.api_key or os.environ.get("T8STAR_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
     csv_path = os.path.abspath(args.csv_input)
     if not os.path.exists(csv_path):
@@ -66,6 +89,28 @@ def main():
             logger.info("成功加载资产路径元数据配置。")
         except Exception as e:
             logger.warning(f"无法加载 assets_metadata.json: {e}")
+
+    # 加载 LLM 智能资产绑定数据（由 bind_assets.py 生成）
+    asset_bindings_path = os.path.join(output_dir, "asset_bindings.json")
+    asset_bindings = {}
+    if os.path.exists(asset_bindings_path):
+        try:
+            with open(asset_bindings_path, "r", encoding="utf-8") as f_bind:
+                asset_bindings = json.load(f_bind)
+            logger.info(f"成功加载 LLM 资产绑定数据，共 {len(asset_bindings)} 个镜头。")
+        except Exception as e:
+            logger.warning(f"无法加载 asset_bindings.json: {e}，将回退到规则匹配。")
+
+    # 加载统一的提示词生成模板 (decoupled_prompts_prompt.txt)
+    decoupled_prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts", "decoupled_prompts_prompt.txt")
+    decoupled_template = ""
+    if os.path.exists(decoupled_prompt_path):
+        try:
+            with open(decoupled_prompt_path, "r", encoding="utf-8") as f_p:
+                decoupled_template = f_p.read()
+            logger.info("成功载入解耦提示词模板。")
+        except Exception as e:
+            logger.warning(f"无法载入 decoupled_prompts_prompt.txt: {e}")
 
     # 读取分镜与新剧本数据
     script_records = []
@@ -104,26 +149,55 @@ def main():
         # 判定参考人像角色
         target_char = r.get("参考角色", "").strip()
         if not target_char:
-            target_char = "主角林艾"
-            if "陈教授" in new_content and "林艾" in new_content:
-                target_char = "林艾与陈教授"
-            elif "陈教授" in new_content:
-                target_char = "陈教授"
-            elif "同事" in new_content:
-                target_char = "林艾与同事"
+            # 尝试从 assets_meta 获取实际角色名称进行动态匹配
+            chars_list = list(assets_meta.get("characters", {}).keys())
+            if chars_list:
+                primary_char = chars_list[0]
+                secondary_char = chars_list[1] if len(chars_list) > 1 else None
+                target_char = primary_char
+                if secondary_char:
+                    sec_kws = ["老师", "周伯", "老园丁", "陈教授", "老钟表匠", "教师", "园艺师", "老者", "长者"]
+                    pri_kws = ["女孩", "林夏", "林禾", "林艾", "主角", "我"]
+                    has_pri = any(k in new_content for k in pri_kws)
+                    has_sec = any(k in new_content for k in sec_kws)
+                    if has_pri and has_sec:
+                        target_char = f"{primary_char}与{secondary_char}"
+                    elif has_sec:
+                        target_char = secondary_char
+            else:
+                target_char = "主角"
 
-        # 1. 动态匹配所有角色参考图，支持一镜包含多个角色
+        # 1. 动态匹配角色参考图 — 优先使用 LLM 绑定结果
         matched_chars_links = []
         char_ref_path = "assets/character_ref.png"
         chars_dict = assets_meta.get("characters", {})
-        if chars_dict:
+        shot_binding = asset_bindings.get(shot_id, {})
+
+        if shot_binding and shot_binding.get("characters") and chars_dict:
+            # 使用 LLM 绑定数据
+            bound_char_names = shot_binding["characters"]
+            bound_char_paths = []
+            for cname in bound_char_names:
+                if cname in chars_dict:
+                    cpath = chars_dict[cname]
+                    bound_char_paths.append(cpath)
+                    matched_chars_links.append(f"[角色参考-{cname}]({cpath})")
+            if bound_char_paths:
+                char_ref_path = ",".join(bound_char_paths)
+            else:
+                # LLM 绑定的名称全部无效，兜底第一个角色
+                first_name = list(chars_dict.keys())[0]
+                first_path = list(chars_dict.values())[0]
+                matched_chars_links.append(f"[角色参考-{first_name}]({first_path})")
+                char_ref_path = first_path
+        elif chars_dict:
+            # 回退到旧的规则匹配
             char_paths, char_names = resolve_asset_paths(target_char, chars_dict, category="characters")
             if char_paths:
                 char_ref_path = ",".join(char_paths)
                 for name_key, path_val in zip(char_names, char_paths):
                     matched_chars_links.append(f"[角色参考-{name_key}]({path_val})")
             else:
-                # 默认兜底使用第一个角色
                 first_name = list(chars_dict.keys())[0]
                 first_path = list(chars_dict.values())[0]
                 matched_chars_links.append(f"[角色参考-{first_name}]({first_path})")
@@ -131,18 +205,35 @@ def main():
         else:
             matched_chars_links.append(f"[角色参考]({char_ref_path})")
 
-        # 2. 动态匹配所有场景参考图
+        # 2. 动态匹配场景参考图 — 优先使用 LLM 绑定结果
         matched_scenes_links = []
         scene_ref_path = "assets/scene_ref.png"
         scenes_dict = assets_meta.get("scenes", {})
-        if scenes_dict:
+
+        if shot_binding and shot_binding.get("scenes") and scenes_dict:
+            # 使用 LLM 绑定数据
+            bound_scene_names = shot_binding["scenes"]
+            bound_scene_paths = []
+            for sname in bound_scene_names:
+                if sname in scenes_dict:
+                    spath = scenes_dict[sname]
+                    bound_scene_paths.append(spath)
+                    matched_scenes_links.append(f"[场景参考-{sname}]({spath})")
+            if bound_scene_paths:
+                scene_ref_path = ",".join(bound_scene_paths)
+            else:
+                first_name = list(scenes_dict.keys())[0]
+                first_path = list(scenes_dict.values())[0]
+                matched_scenes_links.append(f"[场景参考-{first_name}]({first_path})")
+                scene_ref_path = first_path
+        elif scenes_dict:
+            # 回退到旧的规则匹配
             scene_paths, scene_names = resolve_asset_paths(new_scene, scenes_dict, category="scenes")
             if scene_paths:
                 scene_ref_path = ",".join(scene_paths)
                 for name_key, path_val in zip(scene_names, scene_paths):
                     matched_scenes_links.append(f"[场景参考-{name_key}]({path_val})")
             else:
-                # 默认兜底使用第一个场景
                 first_name = list(scenes_dict.keys())[0]
                 first_path = list(scenes_dict.values())[0]
                 matched_scenes_links.append(f"[场景参考-{first_name}]({first_path})")
@@ -155,39 +246,86 @@ def main():
         redraw_video_path = r.get("重绘视频路径", f"generated/Scene-{shot_id}_redraw.mp4")
 
         # 编译首帧与尾帧的文生图/图生图提示词 (完全基于 GPTImage2 和 NanoBanana 规范)
-        first_frame_prompt = build_frame_prompt(
-            scale=scale,
-            target_char=target_char,
-            content=new_content,
-            scene=new_scene,
-            focal_length=focal_length,
-            camera_direction=camera_direction,
-            visual_style=visual_style
-        )
-        
-        if is_end_frame == "是":
-            end_frame_prompt = build_frame_prompt(
+        # 编译首帧与尾帧的生图提示词与视频重绘提示词
+        has_llm_worked = False
+        if api_key and decoupled_template:
+            # 格式化 LLM prompt
+            llm_prompt = decoupled_template \
+                .replace("{shot_id}", shot_id) \
+                .replace("{scale}", scale) \
+                .replace("{movement}", movement) \
+                .replace("{orig_content}", orig_content) \
+                .replace("{new_content}", new_content) \
+                .replace("{is_end_frame}", is_end_frame) \
+                .replace("{end_frame_desc}", end_frame_desc) \
+                .replace("{target_char}", target_char) \
+                .replace("{new_scene}", new_scene) \
+                .replace("{focal_length}", focal_length)
+            
+            try:
+                logger.info(f"正在调用 LLM 生成 镜号 #{shot_id} 的解耦提示词...")
+                response_text = call_t8star_llm(api_key, args.base_url, args.model, llm_prompt, temperature=0.3)
+                if response_text:
+                    cleaned_json = clean_json_response(response_text)
+                    prompt_data = json.loads(cleaned_json)
+                    first_frame_prompt = prompt_data.get("新首帧生图提示词", "").strip()
+                    end_frame_prompt = prompt_data.get("新尾帧生图提示词", "").strip()
+                    prompt = prompt_data.get("视频重绘提示词", "").strip()
+                    if first_frame_prompt and prompt:
+                        has_llm_worked = True
+                        logger.info(f"镜号 #{shot_id} 提示词 LLM 生成成功！")
+            except Exception as e:
+                logger.error(f"调用 LLM 生成 镜号 #{shot_id} 提示词失败: {e}。执行规则兜底...")
+
+        if not has_llm_worked:
+            # 规则拼接兜底逻辑 (原逻辑)
+            first_frame_prompt = build_frame_prompt(
                 scale=scale,
                 target_char=target_char,
-                content=end_frame_desc,
+                content=new_content,
                 scene=new_scene,
                 focal_length=focal_length,
                 camera_direction=camera_direction,
                 visual_style=visual_style
             )
-        else:
-            end_frame_prompt = "无"
+            
+            if is_end_frame == "是":
+                end_frame_prompt = build_frame_prompt(
+                    scale=scale,
+                    target_char=target_char,
+                    content=end_frame_desc,
+                    scene=new_scene,
+                    focal_length=focal_length,
+                    camera_direction=camera_direction,
+                    visual_style=visual_style
+                )
+            else:
+                end_frame_prompt = "无"
 
-        # 使用用户提供的精细 5要素 融合提示词模板
-        audio_part = ""
-        if audio and audio.strip() != "无" and audio.strip() != "无音效":
-            audio_part = f"新音效为：【{audio}】。"
+            dialogue_part = f"新台词/旁白为：【{dialogue}】。" if dialogue and dialogue.strip() not in ["", "无"] else ""
+            audio_part = f"新音效为：【{audio}】。" if audio and audio.strip() not in ["", "无", "无音效"] else ""
+            
+            extra_parts = []
+            if dialogue_part:
+                extra_parts.append(dialogue_part)
+            if audio_part:
+                extra_parts.append(audio_part)
+            if duration:
+                extra_parts.append(f"时长为 {duration}秒。")
+                
+            extra_str = "".join(extra_parts)
+            if extra_str:
+                extra_str = f"同时结合：{extra_str}"
+            else:
+                extra_str = ""
 
-        prompt = (
-            f"根据原视频中的景别（{scale}）、运动镜头（{movement}），结合新焦段（{focal_length}）和镜头方位（{camera_direction}），"
-            f"将场景人物、场景、画面风格和画面内容替换为：【{new_content}】，画面风格为：【{visual_style}】。"
-            f"同时，将场景人物替换成如图所示的参考人像（{target_char}）的样貌和场景。新台词为：【{dialogue}】。{audio_part}时长为 {duration}秒。"
-        )
+            prompt = (
+                f"输入：原镜头视频、新首帧图片、以及资产参考图（角色为：{target_char}，场景为：{new_scene}）。"
+                f"要求：继承新首帧的构图与人物姿态，保持原片视频的运动（{movement}）和节奏，"
+                f"仅将人物替换为资产图角色，场景替换为资产图场景，并将画面调整为新焦段（{focal_length}）的镜头感觉。"
+            )
+            if extra_str:
+                prompt += f" {extra_str}"
 
         # 整合并重构超链接列，包含原片、重绘视频以及匹配到的全部视觉资产链接
         all_links = [
@@ -195,6 +333,12 @@ def main():
             f"[重绘视频]({redraw_video_path})"
         ] + matched_chars_links + matched_scenes_links
         related_links = ", ".join(all_links)
+
+        # 提取实际绑定的资产名称（用于新增的「调用资产」列）
+        bound_char_names = [link.split("-", 1)[1].split("]")[0] for link in matched_chars_links if "-" in link]
+        bound_scene_names = [link.split("-", 1)[1].split("]")[0] for link in matched_scenes_links if "-" in link]
+        bound_chars_str = "、".join(bound_char_names) if bound_char_names else "无"
+        bound_scenes_str = "、".join(bound_scene_names) if bound_scene_names else "无"
 
         prompt_records.append({
             "镜号": shot_id,
@@ -222,7 +366,9 @@ def main():
             "角色参考图路径": char_ref_path,
             "场景参考图路径": scene_ref_path,
             "重绘视频路径": redraw_video_path,
-            "相关链接": related_links
+            "相关链接": related_links,
+            "绑定角色资产": bound_chars_str,
+            "绑定场景资产": bound_scenes_str
         })
 
     # 尝试从现有的 storyboard.md 中读取故事标题以保持一致
@@ -270,8 +416,8 @@ def main():
         f.write("此分镜剧本基于原视频节奏，由大语言模型重构，保持了镜头规格、运镜和时长 100% 对应。\n\n")
         if assets_markdown:
             f.write(assets_markdown)
-        f.write("| 镜号 | 镜头预览 | 镜头参数 | 原片分镜参考 | 全新创意剧本 | 新首帧图像 | 新尾帧图像 | 相关链接 | 视频重绘提示词 |\n")
-        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        f.write("| 镜号 | 镜头预览 | 镜头参数 | 原片分镜参考 | 全新创意剧本 | 调用资产 | 新首帧图像 | 新尾帧图像 | 相关链接 | 视频重绘提示词 |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
         for rec in prompt_records:
             img_md = f"<img src=\"{rec['预览图']}\" width=\"120\" style=\"min-width: 120px;\" />" if rec['预览图'] else "无"
             
@@ -326,8 +472,11 @@ def main():
             links_html = f"<div style=\"min-width: 120px;\">{links_str}</div>"
             
             prompt_clean = rec['视频重绘提示词'].replace("\n", "<br>")
+
+            # 调用资产列
+            asset_str = f"**角色**：{rec['绑定角色资产']}<br>**场景**：{rec['绑定场景资产']}"
             
-            f.write(f"| {rec['镜号']} | {img_md} | {param_str} | {ref_str} | {script_str} | {first_img_md} | {end_img_md} | {links_html} | {prompt_clean} |\n")
+            f.write(f"| {rec['镜号']} | {img_md} | {param_str} | {ref_str} | {script_str} | {asset_str} | {first_img_md} | {end_img_md} | {links_html} | {prompt_clean} |\n")
 
     # 2. 导出/覆写主分镜 CSV 文件
     csv_path_out = os.path.join(output_dir, "storyboard.csv")
@@ -338,6 +487,7 @@ def main():
         "新台词/旁白", "新音效/音乐", "是否需要尾帧", "尾帧画面描述",
         "新首帧生图提示词", "新尾帧生图提示词", "预览图", 
         "原视频路径", "角色参考图路径", "场景参考图路径", "重绘视频路径", "相关链接",
+        "绑定角色资产", "绑定场景资产",
         "视频重绘提示词"
     ]
     with open(csv_path_out, "w", encoding="utf-8-sig", newline="") as f:
@@ -370,6 +520,8 @@ def main():
                 rec["场景参考图路径"],
                 rec["重绘视频路径"],
                 rec["相关链接"],
+                rec["绑定角色资产"],
+                rec["绑定场景资产"],
                 rec["视频重绘提示词"]
             ])
 

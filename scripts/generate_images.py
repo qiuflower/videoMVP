@@ -3,7 +3,7 @@
 脚本名称: generate_images.py
 描述: 
     根据 storyboard.csv 中的首尾帧提示词与 output/asset_prompts.md 中的资产提示词，
-    调用 gpt-image-2 大模型接口 (https://ai.t8star.org/v1/chat/completions) 自动批量生图，
+    调用 gpt-image-2 大模型接口自动批量生图，
     并自动将生成的图像下载并保存到本地 assets/ 目录中，激活 storyboard.md 中的图像预览。
 """
 import os
@@ -18,15 +18,54 @@ import base64
 import glob
 import mimetypes
 import io
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 
 # 动态添加项目根目录到 sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import DEFAULT_STORYBOARD_CSV, DEFAULT_OUTPUT_DIR
+from core.config import DEFAULT_STORYBOARD_CSV, DEFAULT_OUTPUT_DIR, DEFAULT_BASE_URL, DEFAULT_API_KEY
 from core.utils import get_logger, resolve_asset_paths
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 logger = get_logger("generate_images")
+
+# 创建带自动重试的 HTTP Session，处理 SSL EOF / 连接重置等瞬时网络错误
+def _get_http_session():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=2,          # 2s, 4s, 8s, 16s, 32s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    
+    # 保持长连接
+    session.headers.update({"Connection": "keep-alive"})
+    
+    # 代理配置：优先读取 HTTPS_PROXY / HTTP_PROXY 环境变量（.env 中配置也会被 config.py 加载）
+    https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy", "")
+    http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy", "")
+    if https_proxy or http_proxy:
+        session.proxies = {
+            "https": https_proxy or http_proxy,
+            "http": http_proxy or https_proxy,
+        }
+        logger.info(f"已配置 HTTP 代理: http={http_proxy or '(同 https)'}, https={https_proxy or '(同 http)'}")
+    
+    return session
+
+_http_session = _get_http_session()
 
 def generate_image_via_gpt_image_2(api_key, base_url, prompt, base64_images=None):
     """调用 gpt-image-2 chat completion 生图接口，并解析返回的 Markdown 图片 URL，支持多模态双图注入"""
@@ -64,7 +103,7 @@ def generate_image_via_gpt_image_2(api_key, base_url, prompt, base64_images=None
         "messages": messages
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        response = _http_session.post(url, json=payload, headers=headers, timeout=240)
         response.raise_for_status()
         data = response.json()
         content = data["choices"][0]["message"]["content"]
@@ -80,47 +119,21 @@ def generate_image_via_gpt_image_2(api_key, base_url, prompt, base64_images=None
         logger.error(f"API 生图请求失败: {e}")
         return None
 
-def encode_image_to_base64(image_path, max_size=(1024, 1024), quality=80):
-    """读取图片文件，使用 PIL 进行缩放与 JPEG 压缩以减小体积，最后转换为 base64 字符串"""
+def encode_image_to_base64(image_path):
+    """读取图片文件并直接转换为 base64 字符串（不压缩、不缩放）"""
     if not image_path or not os.path.exists(image_path):
         return None, None
     try:
-        mime_type = "image/jpeg"  # 压缩后统一使用 jpeg 格式
-        
-        # 针对小于 200KB 的小图，直接读取，不进行重压缩以节省开销
-        if os.path.getsize(image_path) < 200 * 1024:
-            with open(image_path, "rb") as f:
-                b64_data = base64.b64encode(f.read()).decode('utf-8')
-            guessed_mime, _ = mimetypes.guess_type(image_path)
-            return b64_data, guessed_mime or mime_type
-            
-        # 否则使用 PIL 压缩
-        with Image.open(image_path) as img:
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-                
-            img.thumbnail(max_size, Image.LANCZOS)
-            
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=quality)
-            b64_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            
-            logger.info(f"图片已优化 ({os.path.basename(image_path)}): "
-                        f"原始大小 {os.path.getsize(image_path)/1024:.1f}KB -> "
-                        f"压缩后 {len(buffer.getvalue())/1024:.1f}KB")
-            return b64_data, mime_type
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            mime_type = "image/jpeg"
+        with open(image_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode('utf-8')
+        logger.info(f"已加载参考图 ({os.path.basename(image_path)}): {os.path.getsize(image_path)/1024:.1f}KB")
+        return b64_data, mime_type
     except Exception as e:
-        logger.error(f"优化并转换图片失败 ({image_path}): {e}")
-        try:
-            mime_type, _ = mimetypes.guess_type(image_path)
-            if not mime_type:
-                mime_type = "image/jpeg"
-            with open(image_path, "rb") as image_file:
-                b64_data = base64.b64encode(image_file.read()).decode('utf-8')
-                return b64_data, mime_type
-        except Exception as e2:
-            logger.error(f"Fallback 直接读取图片同样失败 ({image_path}): {e2}")
-            return None, None
+        logger.error(f"读取图片失败 ({image_path}): {e}")
+        return None, None
 
 def get_first_keyframe_path(keyframes_dir, shot_id):
     """获取指定镜号的第一帧关键帧路径"""
@@ -154,8 +167,8 @@ def get_last_keyframe_path(keyframes_dir, shot_id):
         return matches[-1]
     return None
 
-def get_character_ref_paths(row, assets_meta, project_root):
-    """直接从 CSV 字段获取物理图片路径，若无绑定则使用统一的解析函数进行匹配兜底"""
+def get_character_ref_paths(row, assets_meta, project_root, asset_bindings=None):
+    """直接从 CSV 字段获取物理图片路径，若无绑定则使用 LLM 绑定或规则匹配兜底"""
     paths = []
     
     # 1. 优先读取 CSV 中的绑定物理路径
@@ -176,7 +189,21 @@ def get_character_ref_paths(row, assets_meta, project_root):
         if paths:
             return paths
 
-    # 2. 兜底匹配：如果 CSV 字段未绑定，利用统一的工具函数解析匹配
+    # 2. 使用 LLM 绑定数据（如果有的话）
+    shot_id = row.get("镜号", "")
+    if asset_bindings and shot_id in asset_bindings:
+        bound_chars = asset_bindings[shot_id].get("characters", [])
+        characters = assets_meta.get("characters", {})
+        for cname in bound_chars:
+            if cname in characters:
+                full_path = os.path.join(project_root, characters[cname])
+                if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
+                    if full_path not in paths:
+                        paths.append(full_path)
+        if paths:
+            return paths
+
+    # 3. 兜底匹配：利用统一的工具函数解析匹配
     ref_char = row.get("参考角色", "").strip()
     if ref_char and ref_char not in ["无人物", "无"]:
         characters = assets_meta.get("characters", {})
@@ -187,7 +214,7 @@ def get_character_ref_paths(row, assets_meta, project_root):
                 if full_path not in paths:
                     paths.append(full_path)
 
-    # 3. 终极兜底：使用默认参考图
+    # 4. 终极兜底：使用默认参考图
     if not paths:
         fallback_path = os.path.join(project_root, "assets/character_ref.png")
         if os.path.exists(fallback_path):
@@ -195,8 +222,8 @@ def get_character_ref_paths(row, assets_meta, project_root):
             
     return paths
 
-def get_scene_ref_paths(row, assets_meta, project_root):
-    """直接从 CSV 字段获取物理场景图片路径，若无绑定则使用统一的解析函数进行匹配兜底"""
+def get_scene_ref_paths(row, assets_meta, project_root, asset_bindings=None):
+    """直接从 CSV 字段获取物理场景图片路径，若无绑定则使用 LLM 绑定或规则匹配兜底"""
     paths = []
     
     # 1. 优先读取 CSV 中的绑定物理路径
@@ -217,7 +244,21 @@ def get_scene_ref_paths(row, assets_meta, project_root):
         if paths:
             return paths
 
-    # 2. 兜底匹配：如果 CSV 字段未绑定，利用统一的工具函数解析匹配
+    # 2. 使用 LLM 绑定数据（如果有的话）
+    shot_id = row.get("镜号", "")
+    if asset_bindings and shot_id in asset_bindings:
+        bound_scenes = asset_bindings[shot_id].get("scenes", [])
+        scenes = assets_meta.get("scenes", {})
+        for sname in bound_scenes:
+            if sname in scenes:
+                full_path = os.path.join(project_root, scenes[sname])
+                if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
+                    if full_path not in paths:
+                        paths.append(full_path)
+        if paths:
+            return paths
+
+    # 3. 兜底匹配：利用统一的工具函数解析匹配
     ref_scene = row.get("新场景", "").strip()
     if ref_scene and ref_scene not in ["无"]:
         scenes = assets_meta.get("scenes", {})
@@ -228,7 +269,7 @@ def get_scene_ref_paths(row, assets_meta, project_root):
                 if full_path not in paths:
                     paths.append(full_path)
 
-    # 3. 终极兜底：使用默认参考图
+    # 4. 终极兜底：使用默认参考图
     if not paths:
         fallback_path = os.path.join(project_root, "assets/scene_ref.png")
         if os.path.exists(fallback_path):
@@ -239,7 +280,7 @@ def get_scene_ref_paths(row, assets_meta, project_root):
 def download_image(url, save_path):
     """下载图片并保存至本地文件路径"""
     try:
-        response = requests.get(url, timeout=60)
+        response = _http_session.get(url, timeout=60)
         response.raise_for_status()
         with open(save_path, "wb") as f:
             f.write(response.content)
@@ -357,24 +398,38 @@ def process_and_generate_frame(shot_id, prompt, frame_type, keyframe_path, char_
     full_prompt = f"{instructions}Prompt: {prompt}"
     
     logger.info(f"镜号 #{shot_id}: 正在生成新{frame_label} (已注入 {len(base64_images)} 张参考图，其中角色图 {num_char_refs} 张，场景图 {num_scene_refs} 张)...")
-    img_url = generate_image_via_gpt_image_2(api_key, base_url, full_prompt, base64_images)
-    if img_url:
-        download_image(img_url, save_path)
-        time.sleep(1.5)
-    else:
-        logger.error(f"镜号 #{shot_id}: {frame_label}生图请求失败。")
+    
+    # 带重试的生图请求（最多 3 次）
+    max_retries = 3
+    for retry_idx in range(max_retries):
+        img_url = generate_image_via_gpt_image_2(api_key, base_url, full_prompt, base64_images)
+        if img_url:
+            success = download_image(img_url, save_path)
+            if success:
+                time.sleep(1.5)
+                return
+            else:
+                logger.warning(f"镜号 #{shot_id}: {frame_label}图片下载失败。")
+        
+        if retry_idx < max_retries - 1:
+            wait_sec = 2 ** (retry_idx + 1)
+            logger.warning(f"镜号 #{shot_id}: {frame_label}生图失败，第 {retry_idx + 1}/{max_retries} 次重试，等待 {wait_sec} 秒...")
+            time.sleep(wait_sec)
+        else:
+            logger.error(f"镜号 #{shot_id}: {frame_label}生图在 {max_retries} 次重试后仍然失败。")
 
 def main():
     parser = argparse.ArgumentParser(description="调用 gpt-image-2 自动生成并下载分镜所需的所有首尾帧和视觉资产图")
-    parser.add_argument("--api-key", help="t8star API Key")
-    parser.add_argument("--base-url", default="https://ai.t8star.org/v1", help="API 的 baseurl 路径")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="t8star API Key")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API 的 baseurl 路径")
     parser.add_argument("--csv-input", default=DEFAULT_STORYBOARD_CSV, help="分镜 CSV 路径")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录")
     parser.add_argument("--assets-dir", default="assets", help="生成的资产图片保存的目录")
     parser.add_argument("--skip-existing", type=bool, default=True, help="是否跳过本地已存在的图片")
+    parser.add_argument("--concurrency", type=int, default=1, help="并发生图的最大线程数（默认 1）")
     args = parser.parse_args()
 
-    api_key = args.api_key or os.environ.get("T8STAR_API_KEY") or "sk-HZ6UTcRmzWCPue0W3S9JL6YN67h0OilXgIHFPxZWunGWfBDr"
+    api_key = args.api_key or os.environ.get("T8STAR_API_KEY") or DEFAULT_API_KEY
     if not api_key:
         logger.error("缺少 API Key，请在根目录 .env 文件中配置 T8STAR_API_KEY。")
         sys.exit(1)
@@ -390,6 +445,7 @@ def main():
     logger.info("=" * 60)
     logger.info(f"读取分镜表: {csv_path}")
     logger.info(f"图片保存目录: {assets_dir}")
+    logger.info(f"并发线程数: {args.concurrency}")
 
     # ================= 阶段 1: 生成核心资产参考图 =================
     logger.info("\n--- [阶段 1] 自动生成核心视觉资产参考图 ---")
@@ -409,6 +465,8 @@ def main():
             all_assets.update(assets_meta.get("characters", {}))
             all_assets.update(assets_meta.get("scenes", {}))
             
+            # 收集需要生成的资产任务
+            asset_tasks = []
             for asset_name, relative_path in all_assets.items():
                 target_path = os.path.join(os.path.dirname(output_dir), relative_path)
                 
@@ -420,7 +478,6 @@ def main():
                 # 寻找提示词
                 prompt = asset_prompts.get(asset_name)
                 if not prompt:
-                    # 尝试模糊匹配键名
                     for k, p in asset_prompts.items():
                         if asset_name in k or k in asset_name:
                             prompt = p
@@ -429,14 +486,45 @@ def main():
                 if not prompt:
                     logger.warning(f"未找到资产 [{asset_name}] 的提示词，跳过生成。")
                     continue
-                    
+                
+                asset_tasks.append((asset_name, prompt, target_path))
+            
+            # 并发执行资产生成
+            def _generate_asset(asset_name, prompt, target_path):
                 logger.info(f"正在生成资产 [{asset_name}] 的参考图...")
-                img_url = generate_image_via_gpt_image_2(api_key, args.base_url, prompt)
-                if img_url:
-                    download_image(img_url, target_path)
-                    time.sleep(1.5)  # 避免请求过快
-                else:
-                    logger.error(f"资产 [{asset_name}] 生图请求失败。")
+                max_retries = 3
+                for retry_idx in range(max_retries):
+                    img_url = generate_image_via_gpt_image_2(api_key, args.base_url, prompt)
+                    if img_url:
+                        success = download_image(img_url, target_path)
+                        if success:
+                            return True
+                        else:
+                            logger.warning(f"资产 [{asset_name}] 图片下载失败。")
+                    
+                    if retry_idx < max_retries - 1:
+                        wait_sec = 2 ** (retry_idx + 1)
+                        logger.warning(f"资产 [{asset_name}] 生图失败，第 {retry_idx + 1}/{max_retries} 次重试，等待 {wait_sec} 秒...")
+                        time.sleep(wait_sec)
+                    else:
+                        logger.error(f"资产 [{asset_name}] 生图在 {max_retries} 次重试后仍然失败。")
+                return False
+            
+            if asset_tasks:
+                logger.info(f"共 {len(asset_tasks)} 个资产待生成，使用 {args.concurrency} 个线程并发处理...")
+                with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+                    futures = {
+                        executor.submit(_generate_asset, name, prompt, path): name
+                        for name, prompt, path in asset_tasks
+                    }
+                    for future in as_completed(futures):
+                        name = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"资产 [{name}] 生成异常: {e}")
+            else:
+                logger.info("所有资产已存在，无需生成。")
         except Exception as e:
             logger.error(f"生成核心资产图片失败: {e}")
     else:
@@ -465,60 +553,105 @@ def main():
         except Exception as e:
             logger.error(f"读取 assets_metadata.json 失败: {e}")
 
+    # 载入 LLM 资产绑定数据（由 bind_assets.py 生成）
+    asset_bindings_path = os.path.join(output_dir, "asset_bindings.json")
+    asset_bindings = {}
+    if os.path.exists(asset_bindings_path):
+        try:
+            with open(asset_bindings_path, "r", encoding="utf-8") as f_bind:
+                asset_bindings = json.load(f_bind)
+            logger.info(f"成功加载 LLM 资产绑定数据，共 {len(asset_bindings)} 个镜头。")
+        except Exception as e:
+            logger.warning(f"无法加载 asset_bindings.json: {e}，将回退到 CSV/规则匹配。")
+
     project_root = os.path.dirname(output_dir)
     keyframes_dir = os.path.join(output_dir, "keyframes")
 
+    # 预先收集所有帧生成任务
+    frame_tasks = []
     for row in script_records:
         shot_id = row["镜号"]
         is_end_frame = row.get("是否需要尾帧", "否")
         first_prompt = row.get("新首帧生图提示词", "")
         end_prompt = row.get("新尾帧生图提示词", "")
         
-        # 1. 匹配对应的角色与场景资产图列表
-        char_ref_paths = get_character_ref_paths(row, assets_meta, project_root)
-        scene_ref_paths = get_scene_ref_paths(row, assets_meta, project_root)
+        # 匹配对应的角色与场景资产图列表（优先使用 LLM 绑定数据）
+        char_ref_paths = get_character_ref_paths(row, assets_meta, project_root, asset_bindings)
+        scene_ref_paths = get_scene_ref_paths(row, assets_meta, project_root, asset_bindings)
         if char_ref_paths or scene_ref_paths:
             logger.info(f"镜号 #{shot_id}: 匹配到资产参考图 - 角色: {char_ref_paths}, 场景: {scene_ref_paths}")
         
-        # 2. 处理首帧
+        # 首帧任务
         first_img_name = f"Scene-{shot_id}_first.png"
         first_img_path = os.path.join(assets_dir, first_img_name)
         kf_first_path = get_first_keyframe_path(keyframes_dir, shot_id)
+        frame_tasks.append({
+            "shot_id": shot_id,
+            "prompt": first_prompt,
+            "frame_type": "first",
+            "keyframe_path": kf_first_path,
+            "char_ref_paths": char_ref_paths,
+            "scene_ref_paths": scene_ref_paths,
+            "save_path": first_img_path,
+        })
         
-        process_and_generate_frame(
-            shot_id=shot_id,
-            prompt=first_prompt,
-            frame_type="first",
-            keyframe_path=kf_first_path,
-            char_ref_paths=char_ref_paths,
-            scene_ref_paths=scene_ref_paths,
-            api_key=api_key,
-            base_url=args.base_url,
-            save_path=first_img_path,
-            skip_existing=args.skip_existing
-        )
-        
-        # 3. 处理尾帧
+        # 尾帧任务
         if is_end_frame == "是":
             end_img_name = f"Scene-{shot_id}_last.png"
             end_img_path = os.path.join(assets_dir, end_img_name)
             kf_last_path = get_last_keyframe_path(keyframes_dir, shot_id)
-            
+            frame_tasks.append({
+                "shot_id": shot_id,
+                "prompt": end_prompt,
+                "frame_type": "last",
+                "keyframe_path": kf_last_path,
+                "char_ref_paths": char_ref_paths,
+                "scene_ref_paths": scene_ref_paths,
+                "save_path": end_img_path,
+            })
+
+    logger.info(f"共 {len(frame_tasks)} 个帧生成任务，使用 {args.concurrency} 个线程并发处理...")
+    
+    # 并发执行帧生成
+    completed_count = 0
+    failed_count = 0
+    total_count = len(frame_tasks)
+    count_lock = threading.Lock()
+    
+    def _generate_frame_task(task):
+        nonlocal completed_count, failed_count
+        try:
             process_and_generate_frame(
-                shot_id=shot_id,
-                prompt=end_prompt,
-                frame_type="last",
-                keyframe_path=kf_last_path,
-                char_ref_paths=char_ref_paths,
-                scene_ref_paths=scene_ref_paths,
+                shot_id=task["shot_id"],
+                prompt=task["prompt"],
+                frame_type=task["frame_type"],
+                keyframe_path=task["keyframe_path"],
+                char_ref_paths=task["char_ref_paths"],
+                scene_ref_paths=task["scene_ref_paths"],
                 api_key=api_key,
                 base_url=args.base_url,
-                save_path=end_img_path,
+                save_path=task["save_path"],
                 skip_existing=args.skip_existing
             )
+            with count_lock:
+                completed_count += 1
+                logger.info(f"进度: {completed_count + failed_count}/{total_count} (成功: {completed_count}, 失败: {failed_count})")
+        except Exception as e:
+            with count_lock:
+                failed_count += 1
+            frame_label = "首帧" if task["frame_type"] == "first" else "尾帧"
+            logger.error(f"镜号 #{task['shot_id']} {frame_label}生成异常: {e}")
+    
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        futures = [executor.submit(_generate_frame_task, task) for task in frame_tasks]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"帧生成线程异常: {e}")
 
     logger.info("=" * 60)
-    logger.info("  所有首尾帧图像生成下载完成！  ".center(60))
+    logger.info(f"  所有首尾帧图像生成完成！成功: {completed_count}, 失败: {failed_count}  ".center(60))
     logger.info("=" * 60)
 
 if __name__ == "__main__":

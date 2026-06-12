@@ -23,7 +23,7 @@ import time
 # 动态添加项目根目录到 sys.path，支持在任意目录下运行该脚本
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import DEFAULT_STORYBOARD_CSV, DEFAULT_OUTPUT_DIR
+from core.config import DEFAULT_STORYBOARD_CSV, DEFAULT_OUTPUT_DIR, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_API_KEY
 from core.llm_client import call_t8star_llm
 from core.utils import clean_json_response, get_logger
 
@@ -31,9 +31,9 @@ logger = get_logger("rewrite_script")
 
 def main():
     parser = argparse.ArgumentParser(description="根据原分镜节奏生成全新故事剧本")
-    parser.add_argument("--api-key", help="t8star API Key")
-    parser.add_argument("--model", default="gpt-5.4-mini-2026-03-17", help="调用的模型名称")
-    parser.add_argument("--base-url", default="https://ai.t8star.org/v1", help="API 的 baseurl 路径")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="t8star API Key")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="调用的模型名称")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API 的 baseurl 路径")
     parser.add_argument("--csv-input", default=DEFAULT_STORYBOARD_CSV, help="原分镜 CSV 路径")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录")
     parser.add_argument("--storyline", default="", help="新故事的大纲，如果提供则使用该大纲进行改写")

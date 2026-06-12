@@ -27,7 +27,7 @@ from tqdm import tqdm
 # 动态添加项目根目录到 sys.path，支持在任意目录下运行该脚本
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import DEFAULT_OUTPUT_SCENES_DIR, DEFAULT_OUTPUT_DIR
+from core.config import DEFAULT_OUTPUT_SCENES_DIR, DEFAULT_OUTPUT_DIR, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_API_KEY
 from core.llm_client import call_t8star_vision_api
 from core.utils import clean_json_response, get_logger
 
@@ -133,9 +133,9 @@ def parse_llm_json(content):
 
 def main():
     parser = argparse.ArgumentParser(description="使用 t8star LLM 批量生成视频镜头分镜表")
-    parser.add_argument("--api-key", help="t8star API 密钥。也可以设置环境变量 T8STAR_API_KEY")
-    parser.add_argument("--model", default="gpt-5.4-mini-2026-03-17", help="调用的模型名称")
-    parser.add_argument("--base-url", default="https://ai.t8star.org/v1", help="API 的 baseurl 路径")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="t8star API 密钥。也可以设置环境变量 T8STAR_API_KEY")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="调用的模型名称")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API 的 baseurl 路径")
     parser.add_argument("--scenes-dir", default=DEFAULT_OUTPUT_SCENES_DIR, help="切分视频片段所在目录")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="分镜表等结果输出目录")
     args = parser.parse_args()
@@ -245,11 +245,47 @@ def main():
         # 4. 构建提示词
         prompt = vision_prompt_template.format(duration=duration)
 
-        # 5. 调用 API
-        llm_response = call_t8star_vision_api(api_key, args.base_url, args.model, prompt, base64_images)
+        # 5. 调用 API（带业务层重试：若 LLM 返回 None 或解析失败，最多重试 3 次）
+        max_shot_retries = 3
+        parsed_data = None
+        for retry_idx in range(max_shot_retries):
+            llm_response = call_t8star_vision_api(api_key, args.base_url, args.model, prompt, base64_images)
+            
+            if llm_response is None:
+                if retry_idx < max_shot_retries - 1:
+                    wait_sec = 2 ** (retry_idx + 1)
+                    logger.warning(f"镜号 #{shot_num}: LLM 返回为空，第 {retry_idx + 1}/{max_shot_retries} 次重试，等待 {wait_sec} 秒...")
+                    time.sleep(wait_sec)
+                    continue
+                else:
+                    logger.error(f"镜号 #{shot_num}: LLM 调用在 {max_shot_retries} 次重试后仍然失败，将使用默认值。")
+                    break
+            
+            # 6. 解析结果
+            parsed_data = parse_llm_json(llm_response)
+            
+            # 检查解析是否真正成功（非默认兜底值）
+            if parsed_data and parsed_data.get("画面内容", "").startswith("解析失败"):
+                if retry_idx < max_shot_retries - 1:
+                    wait_sec = 2 ** (retry_idx + 1)
+                    logger.warning(f"镜号 #{shot_num}: LLM 返回内容解析失败，第 {retry_idx + 1}/{max_shot_retries} 次重试，等待 {wait_sec} 秒...")
+                    time.sleep(wait_sec)
+                    parsed_data = None
+                    continue
+                else:
+                    logger.warning(f"镜号 #{shot_num}: 解析在 {max_shot_retries} 次重试后仍然失败，使用最后一次解析结果。")
+            else:
+                break  # 成功解析，退出重试循环
         
-        # 6. 解析结果
-        parsed_data = parse_llm_json(llm_response)
+        # 如果所有重试都失败，使用默认值
+        if parsed_data is None:
+            parsed_data = {
+                "景别": "未知",
+                "运动镜头": "未知",
+                "画面内容": "LLM 调用失败",
+                "台词_旁白": "无",
+                "音效_音乐": "无"
+            }
         
         # 选取第 2 张图（中间帧）作为预览图在 Markdown 中展示
         preview_img_relative = ""
